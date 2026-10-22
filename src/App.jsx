@@ -80,6 +80,19 @@ function interpretSheetQuery(input, columns) {
   return { error: 'Supported: sum, average, count, min, max, sort, filter, hide empty, and reset view.' }
 }
 
+// Display formatting never changes the underlying numeric value or formula.
+function formatCellDisplay(value, format) {
+  if (!format || format === 'general') return value
+  const text = String(value ?? '')
+  if (!text.trim() || !Number.isFinite(Number(text))) return value
+  const number = Number(text)
+  if (format === 'integer') return number.toLocaleString('en-US', { maximumFractionDigits: 0 })
+  if (format === 'decimal') return number.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  if (format === 'currency') return number.toLocaleString('en-US', { style: 'currency', currency: 'USD' })
+  if (format === 'percent') return number.toLocaleString('en-US', { style: 'percent', minimumFractionDigits: 1, maximumFractionDigits: 1 })
+  return value
+}
+
 export default function App() {
   // Engine instance is created once and reused across renders
   // Note: The engine maintains its own internal state, so React state is only used for UI updates
@@ -365,6 +378,35 @@ export default function App() {
     }
   }, [selectedCell, selectionEnd])
 
+  // Challenge 5: Apply formatting to every cell in the selected rectangle.
+  // Keep the existing style attributes while changing only the requested ones.
+  const applyRangeStyle = useCallback((updates) => {
+    if (!selectionBounds) return
+    setCellStyles(previous => {
+      const next = { ...previous }
+      for (let r = selectionBounds.minRow; r <= selectionBounds.maxRow; r++) {
+        for (let c = selectionBounds.minCol; c <= selectionBounds.maxCol; c++) {
+          const key = `${r},${c}`
+          next[key] = { ...previous[key], ...updates }
+        }
+      }
+      return next
+    })
+  }, [selectionBounds])
+
+  const clearRangeFormatting = useCallback(() => {
+    if (!selectionBounds) return
+    setCellStyles(previous => {
+      const next = { ...previous }
+      for (let r = selectionBounds.minRow; r <= selectionBounds.maxRow; r++) {
+        for (let c = selectionBounds.minCol; c <= selectionBounds.maxCol; c++) {
+          delete next[`${r},${c}`]
+        }
+      }
+      return next
+    })
+  }, [selectionBounds])
+
   const finishFill = useCallback(() => {
     const drag = fillDragRef.current
     fillDragRef.current = null
@@ -629,6 +671,32 @@ export default function App() {
           </div>
         </div>
 
+        {/* ── Challenge 5: range formatting and numeric display formats ── */}
+        <div aria-label="Range formatting" style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 10, padding: '10px 12px', background: '#f8fafc', borderBottom: '1px solid #cbd5e1', fontSize: 13 }}>
+          <strong>Format Selection</strong>
+          <span style={{ color: '#64748b' }}>Select cells first; changes apply to the whole range.</span>
+          <label>Number format{' '}
+            <select aria-label="Number format" value={selectedCellStyle?.numberFormat || 'general'} disabled={!selectedCell} onChange={e => applyRangeStyle({ numberFormat: e.target.value })}>
+              <option value="general">General</option>
+              <option value="integer">Number (0 decimals)</option>
+              <option value="decimal">Number (2 decimals)</option>
+              <option value="currency">Currency (USD)</option>
+              <option value="percent">Percentage</option>
+            </select>
+          </label>
+          <label>Border{' '}
+            <select aria-label="Cell borders" value={selectedCellStyle?.border || 'none'} disabled={!selectedCell} onChange={e => applyRangeStyle({ border: e.target.value })}>
+              <option value="none">None</option>
+              <option value="all">All borders</option>
+              <option value="bottom">Bottom border</option>
+              <option value="top">Top border</option>
+            </select>
+          </label>
+          <button className="toolbar-btn" disabled={!selectedCell} onClick={() => applyRangeStyle({ bold: true })}>Bold range</button>
+          <button className="toolbar-btn" disabled={!selectedCell} onClick={() => applyRangeStyle({ bg: '#fff2b3' })}>Highlight range</button>
+          <button className="toolbar-btn" disabled={!selectedCell} onClick={clearRangeFormatting}>Clear formatting</button>
+        </div>
+
         {/* ── Challenge 2: Sort and filter (non-destructive view) ── */}
         <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 10, padding: '10px 12px', background: '#f1f5f9', borderBottom: '1px solid #d1d5db', fontSize: 13 }}>
           <strong>Sort &amp; Filter</strong>
@@ -716,7 +784,7 @@ export default function App() {
                       <td
                         key={colIndex}
                         className={`cell ${isSelected ? 'selected' : ''} ${fillTarget && selectionBounds && colIndex >= selectionBounds.minCol && colIndex <= selectionBounds.maxCol && rowIndex > selectionBounds.maxRow && rowIndex <= fillTarget.r ? 'selected' : ''}`}
-                        style={{ background: style.bg || 'white', position: 'relative' }}
+                        style={{ background: style.bg || 'white', position: 'relative', boxShadow: style.border === 'all' ? 'inset 0 0 0 1px #64748b' : style.border === 'bottom' ? 'inset 0 -2px 0 #64748b' : style.border === 'top' ? 'inset 0 2px 0 #64748b' : undefined }}
                         onMouseDown={(e) => {
                           if (e.target.tagName === 'INPUT') return
                           e.preventDefault()
@@ -758,7 +826,7 @@ export default function App() {
                               fontSize: (style.fontSize || 13) + 'px',
                             }}
                           >
-                            {displayValue}
+                            {cellData.error ? displayValue : formatCellDisplay(displayValue, style.numberFormat)}
                           </div>
                         )}
                         {!viewIsModified && isSelected && selectionBounds && rowIndex === selectionBounds.maxRow && colIndex === selectionBounds.maxCol && !isEditing && (
