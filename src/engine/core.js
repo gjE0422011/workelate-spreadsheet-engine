@@ -936,6 +936,16 @@ export function createEngine(initialRows = 50, initialCols = 50) {
         get rows() { return rows },
         get cols() { return cols },
         getCell: getCellForDisplay,
+        getLastNonEmptyRow: () => {
+            let last = 0
+            for (const [key, cell] of cells) {
+                if (cell && String(cell.raw ?? '').trim()) {
+                    const row = Number(key.match(/\d+$/)?.[0] ?? 1) - 1
+                    if (row > last) last = row
+                }
+            }
+            return last
+        },
         setCell: executeSetCell,
         setCells: executeSetCells,
         insertRow: executeInsertRow,
