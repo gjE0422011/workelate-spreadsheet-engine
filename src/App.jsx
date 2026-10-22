@@ -1,23 +1,114 @@
-import { useState, useRef, useCallback, useMemo } from 'react'
+import { useState, useRef, useCallback, useMemo, useEffect } from 'react'
 import './App.css'
 import { createEngine } from './engine/core.js'
 import { loadSampleSmall, loadSampleLarge } from './fixtures/loadSample.js'
 
 const TOTAL_ROWS = 50
 const TOTAL_COLS = 50
+const VIRTUAL_ROW_HEIGHT = 32
+const VIRTUAL_OVERSCAN = 10
+
+// Shift relative formula references while preserving $-anchored references.
+function shiftFillFormula(raw, rowOffset, colOffset) {
+  return raw.replace(/(\$?)([A-Z]+)(\$?)(\d+)/g, (full, colLock, letters, rowLock, digits) => {
+    let col = 0
+    for (const char of letters) col = col * 26 + char.charCodeAt(0) - 64
+    col--
+    const row = Number(digits) - 1
+    const newCol = colLock ? col : col + colOffset
+    const newRow = rowLock ? row : row + rowOffset
+    if (newCol < 0 || newRow < 0) return '#REF!'
+    let n = newCol + 1
+    let label = ''
+    while (n) { n--; label = String.fromCharCode(65 + n % 26) + label; n = Math.floor(n / 26) }
+    return `${colLock}${label}${rowLock}${newRow + 1}`
+  })
+}
+
+function extendFillValue(seedValues, index) {
+  const first = String(seedValues[0] ?? '')
+  if (first.startsWith('=')) return first
+  const allNumbers = seedValues.every(v => String(v).trim() !== '' && Number.isFinite(Number(v)))
+  if (allNumbers && seedValues.length >= 2) {
+    const step = Number(seedValues[1]) - Number(seedValues[0])
+    return String(Number(seedValues[0]) + step * index)
+  }
+  const match = first.match(/^(.*?)(\d+)$/)
+  if (match && seedValues.length >= 2) {
+    const second = String(seedValues[1]).match(/^(.*?)(\d+)$/)
+    if (second && second[1] === match[1]) {
+      const step = Number(second[2]) - Number(match[2])
+      return match[1] + String(Number(match[2]) + step * index).padStart(match[2].length, '0')
+    }
+  }
+  return String(seedValues[index % seedValues.length] ?? '')
+}
+
+
+// Challenge 4: transparent, local natural-language query interpreter (no external AI API).
+function interpretSheetQuery(input, columns) {
+  const query = input.trim()
+  const lower = query.toLowerCase()
+  if (!query) return { error: 'Enter a spreadsheet question or command.' }
+  const columnMatch = lower.match(/\b(?:column|col)\s+([a-z]{1,3})\b/) || lower.match(/\b([a-z]{1,3})\s+column\b/)
+  let col = -1
+  if (columnMatch) {
+    col = [...columnMatch[1].toUpperCase()].reduce((n, ch) => n * 26 + ch.charCodeAt(0) - 64, 0) - 1
+  } else {
+    // Allow bare single-letter references for queries such as "sum B".
+    const match = lower.match(/\b(?:sum|total|average|avg|mean|minimum|min|maximum|max|count|sort|filter)\s+(?:of\s+)?([a-z])\b/)
+    if (match) col = match[1].toUpperCase().charCodeAt(0) - 65
+  }
+  if (/\b(reset|clear)\s+(?:the\s+)?(?:view|filters?|sorting)\b/.test(lower) || lower === 'show all rows') return { type: 'reset' }
+  if (/\b(hide empty|nonempty|non-empty)\b/.test(lower)) return { type: 'hideEmpty' }
+  if (col < 0 || col >= columns) return { error: 'Please specify a valid column, such as A, B, or C.' }
+  if (/\b(sort|order|rank)\b/.test(lower)) {
+    const desc = /\b(desc|descending|highest|largest|biggest|z\s*to\s*a|high to low|decreasing)\b/.test(lower)
+    return { type: 'sort', col, direction: desc ? 'desc' : 'asc' }
+  }
+  if (/\b(filter|find|show|contains?|search)\b/.test(lower)) {
+    const term = query.match(/\b(?:for|containing|contains|equals|equal to|matching|with|is)\s+["']?(.+?)["']?\s*$/i)
+    if (!term) return { error: 'Try: filter column A for Alice' }
+    return { type: 'filter', col, term: term[1].trim().replace(/^["']|["']$/g, '') }
+  }
+  const aggregate = /\b(average|avg|mean)\b/.test(lower) ? 'average'
+    : /\b(sum|total)\b/.test(lower) ? 'sum'
+    : /\b(count|how many)\b/.test(lower) ? 'count'
+    : /\b(minimum|min|smallest|lowest)\b/.test(lower) ? 'min'
+    : /\b(maximum|max|largest|highest)\b/.test(lower) ? 'max' : null
+  if (aggregate) return { type: 'aggregate', col, aggregate }
+  return { error: 'Supported: sum, average, count, min, max, sort, filter, hide empty, and reset view.' }
+}
 
 export default function App() {
   // Engine instance is created once and reused across renders
   // Note: The engine maintains its own internal state, so React state is only used for UI updates
   const [engine] = useState(() => createEngine(TOTAL_ROWS, TOTAL_COLS))
-  const [, setVersion] = useState(0)
+  const [version, setVersion] = useState(0)
   const [selectedCell, setSelectedCell] = useState(null)
+  const [selectionEnd, setSelectionEnd] = useState(null)
+  const isDraggingRef = useRef(false)
+  const fillDragRef = useRef(null)
+  const [fillTarget, setFillTarget] = useState(null)
   const [editingCell, setEditingCell] = useState(null)
   const [editValue, setEditValue] = useState('')
   // Cell styles are stored separately from engine data
   // Format: { "row,col": { bold: bool, italic: bool, ... } }
   const [cellStyles, setCellStyles] = useState({})
   const cellInputRef = useRef(null)
+  // Challenge 2: sorting and filtering are non-destructive views.
+  // Physical cell coordinates, formulas and styles remain unchanged.
+  const [sortColumn, setSortColumn] = useState(0)
+  const [sortDirection, setSortDirection] = useState('none')
+  const [filterColumn, setFilterColumn] = useState(0)
+  const [filterText, setFilterText] = useState('')
+  const [hideEmpty, setHideEmpty] = useState(false)
+  const gridScrollRef = useRef(null)
+  const [scrollTop, setScrollTop] = useState(0)
+  const [viewportHeight, setViewportHeight] = useState(560)
+  const [queryText, setQueryText] = useState('')
+  const [queryResult, setQueryResult] = useState('Try "sum column B" or "filter column A for Alice".')
+
 
   const forceRerender = useCallback(() => setVersion(v => v + 1), [])
 
@@ -59,14 +150,33 @@ export default function App() {
     setEditingCell(null)
   }, [engine, editValue, forceRerender])
 
-  const handleCellClick = useCallback((row, col) => {
-    if (editingCell && (editingCell.r !== row || editingCell.c !== col)) {
-      commitEdit(editingCell.r, editingCell.c)
+  const handleCellClick = useCallback((row, col, shiftKey = false) => {
+    if (editingCell) commitEdit(editingCell.r, editingCell.c)
+
+    if (shiftKey && selectedCell) {
+      setSelectionEnd({ r: row, c: col })
+    } else {
+      setSelectedCell({ r: row, c: col })
+      setSelectionEnd({ r: row, c: col })
     }
-    if (!editingCell || editingCell.r !== row || editingCell.c !== col) {
-      startEditing(row, col)
-    }
-  }, [editingCell, commitEdit, startEditing])
+    setEditingCell(null)
+  }, [editingCell, commitEdit, selectedCell])
+
+  const handleCellDoubleClick = useCallback((row, col) => {
+    setSelectionEnd({ r: row, c: col })
+    startEditing(row, col)
+  }, [startEditing])
+
+  const handleCellMouseEnter = useCallback((row, col) => {
+    if (fillDragRef.current) {
+      fillDragRef.current.target = { r: row, c: col }
+      setFillTarget({ r: row, c: col })
+    } else if (isDraggingRef.current) setSelectionEnd({ r: row, c: col })
+  }, [])
+
+  const handleCellMouseUp = useCallback(() => {
+    isDraggingRef.current = false
+  }, [])
 
   // ────── Keyboard navigation ──────
 
@@ -192,6 +302,7 @@ export default function App() {
     forceRerender()
     setCellStyles({})
     setSelectedCell(null)
+    setSelectionEnd(null)
     setEditingCell(null)
     setEditValue('')
   }, [engine, forceRerender])
@@ -202,6 +313,7 @@ export default function App() {
     loader(engine)
     forceRerender()
     setSelectedCell({ r: 0, c: 0 })
+    setSelectionEnd({ r: 0, c: 0 })
     setEditingCell(null)
     setEditValue('')
   }, [engine, forceRerender])
@@ -241,6 +353,174 @@ export default function App() {
   }, [selectedCell, engine, forceRerender])
 
   // ────── Derived state ──────
+
+  const selectionBounds = useMemo(() => {
+    if (!selectedCell) return null
+    const end = selectionEnd || selectedCell
+    return {
+      minRow: Math.min(selectedCell.r, end.r),
+      maxRow: Math.max(selectedCell.r, end.r),
+      minCol: Math.min(selectedCell.c, end.c),
+      maxCol: Math.max(selectedCell.c, end.c),
+    }
+  }, [selectedCell, selectionEnd])
+
+  const finishFill = useCallback(() => {
+    const drag = fillDragRef.current
+    fillDragRef.current = null
+    setFillTarget(null)
+    isDraggingRef.current = false
+    if (!drag) return
+    const { bounds, target } = drag
+    if (!target || target.r <= bounds.maxRow || target.c < bounds.minCol || target.c > bounds.maxCol) return
+    const changes = []
+    const styleUpdates = {}
+    for (let c = bounds.minCol; c <= bounds.maxCol; c++) {
+      const seeds = []
+      for (let r = bounds.minRow; r <= bounds.maxRow; r++) seeds.push(engine.getCell(r, c).raw)
+      const seedCount = seeds.length
+      for (let r = bounds.maxRow + 1; r <= target.r; r++) {
+        const index = r - bounds.minRow
+        const seedIndex = (index % seedCount)
+        const sourceRow = bounds.minRow + seedIndex
+        const raw = seeds[seedIndex]
+        const value = raw.startsWith('=')
+          ? shiftFillFormula(raw, r - sourceRow, 0)
+          : extendFillValue(seeds, index)
+        changes.push({ row: r, col: c, value })
+        const sourceStyle = cellStyles[`${sourceRow},${c}`]
+        if (sourceStyle) styleUpdates[`${r},${c}`] = { ...sourceStyle }
+      }
+    }
+    engine.ensureCapacity(target.r + 1, engine.cols)
+    engine.setCells(changes)
+    if (Object.keys(styleUpdates).length) setCellStyles(prev => ({ ...prev, ...styleUpdates }))
+    setSelectedCell({ r: bounds.minRow, c: bounds.minCol })
+    setSelectionEnd({ r: target.r, c: bounds.maxCol })
+    forceRerender()
+  }, [engine, cellStyles, forceRerender])
+
+  // Capture mouse release even when the pointer leaves the grid.
+  // React's grid onMouseUp alone can miss the end of a fill drag.
+  const finishFillRef = useRef(finishFill)
+  useEffect(() => { finishFillRef.current = finishFill }, [finishFill])
+  useEffect(() => {
+    const onGlobalMouseUp = () => {
+      isDraggingRef.current = false
+      if (fillDragRef.current) finishFillRef.current()
+    }
+    window.addEventListener('mouseup', onGlobalMouseUp)
+    return () => window.removeEventListener('mouseup', onGlobalMouseUp)
+  }, [])
+
+  const visibleRows = useMemo(() => {
+    const rows = Array.from({ length: engine.rows }, (_, r) => r)
+    const valueAt = (r, c) => {
+      const cell = engine.getCell(r, c)
+      return String(cell.error ?? cell.computed ?? cell.raw ?? '')
+    }
+    const needle = filterText.trim().toLocaleLowerCase()
+    const filtered = rows.filter(r => {
+      if (needle && !valueAt(r, filterColumn).toLocaleLowerCase().includes(needle)) return false
+      if (hideEmpty && !Array.from({ length: engine.cols }, (_, c) => engine.getCell(r, c).raw).some(Boolean)) return false
+      return true
+    })
+    if (sortDirection !== 'none') {
+      filtered.sort((a, b) => {
+        const x = valueAt(a, sortColumn).trim()
+        const y = valueAt(b, sortColumn).trim()
+        if (!x && !y) return a - b
+        if (!x) return 1
+        if (!y) return -1
+        const xn = Number(x), yn = Number(y)
+        const cmp = x !== '' && y !== '' && Number.isFinite(xn) && Number.isFinite(yn)
+          ? xn - yn
+          : x.localeCompare(y, undefined, { numeric: true, sensitivity: 'base' })
+        return (sortDirection === 'asc' ? cmp : -cmp) || a - b
+      })
+    }
+    return filtered
+  }, [engine, version, sortColumn, sortDirection, filterColumn, filterText, hideEmpty])
+
+  // Challenge 3: Only mount rows intersecting the viewport plus overscan.
+  // Preserve their original engine row IDs so formulas and edits stay correct.
+  useEffect(() => {
+    const element = gridScrollRef.current
+    if (!element) return
+    const measure = () => setViewportHeight(element.clientHeight || 560)
+    measure()
+    if (typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(measure)
+    observer.observe(element)
+    return () => observer.disconnect()
+  }, [])
+
+  useEffect(() => {
+    const element = gridScrollRef.current
+    if (element) element.scrollTop = 0
+    setScrollTop(0)
+  }, [sortColumn, sortDirection, filterColumn, filterText, hideEmpty])
+
+  const firstVisibleIndex = Math.min(
+    visibleRows.length,
+    Math.max(0, Math.floor(scrollTop / VIRTUAL_ROW_HEIGHT) - VIRTUAL_OVERSCAN)
+  )
+  const lastVisibleIndex = Math.min(
+    visibleRows.length,
+    Math.ceil((scrollTop + viewportHeight) / VIRTUAL_ROW_HEIGHT) + VIRTUAL_OVERSCAN
+  )
+  const renderedRows = visibleRows.slice(firstVisibleIndex, lastVisibleIndex)
+  const topSpacerHeight = firstVisibleIndex * VIRTUAL_ROW_HEIGHT
+  const bottomSpacerHeight = (visibleRows.length - lastVisibleIndex) * VIRTUAL_ROW_HEIGHT
+
+  const runSheetQuery = useCallback((event) => {
+    event.preventDefault()
+    const command = interpretSheetQuery(queryText, engine.cols)
+    if (command.error) { setQueryResult(command.error); return }
+    if (command.type === 'reset') {
+      setSortDirection('none'); setFilterText(''); setHideEmpty(false)
+      setQueryResult('View reset. All rows are visible in their original order.')
+      return
+    }
+    if (command.type === 'hideEmpty') {
+      setHideEmpty(true)
+      setQueryResult('Empty rows are now hidden. Use "reset view" to restore them.')
+      return
+    }
+    const label = (() => { let n = command.col + 1, out = ''; while (n) { n--; out = String.fromCharCode(65 + n % 26) + out; n = Math.floor(n / 26) } return out })()
+    if (command.type === 'sort') {
+      setSortColumn(command.col); setSortDirection(command.direction)
+      setQueryResult(`Sorted the display by column ${label} (${command.direction === 'asc' ? 'ascending' : 'descending'}). Cell positions are unchanged.`)
+      return
+    }
+    if (command.type === 'filter') {
+      setFilterColumn(command.col); setFilterText(command.term)
+      setQueryResult(`Showing rows where column ${label} contains "${command.term}".`)
+      return
+    }
+    if (command.type === 'aggregate') {
+      // Calculate against rows in the current view, ignoring blanks and nonnumeric values.
+      const cells = visibleRows.map(r => engine.getCell(r, command.col))
+      const nonblank = cells.map(c => String(c.error ?? c.computed ?? c.raw ?? '').trim()).filter(Boolean)
+      const numeric = nonblank.map(Number).filter(Number.isFinite)
+      const values = numeric
+      let result
+      if (command.aggregate === 'count') result = nonblank.length
+      else if (!values.length) { setQueryResult(`No numeric values found in column ${label} within the current view.`); return }
+      else if (command.aggregate === 'sum') result = values.reduce((a,b) => a+b, 0)
+      else if (command.aggregate === 'average') result = values.reduce((a,b) => a+b, 0) / values.length
+      else if (command.aggregate === 'min') result = Math.min(...values)
+      else result = Math.max(...values)
+      setQueryResult(`${command.aggregate.toUpperCase()} of column ${label}: ${Number(result.toPrecision(12)).toLocaleString()} (${command.aggregate === 'count' ? nonblank.length + ' nonempty cells' : numeric.length + ' numeric cells'} in the current view).`)
+    }
+  }, [queryText, engine, visibleRows])
+
+  const viewIsModified = sortDirection !== 'none' || filterText.trim() !== '' || hideEmpty
+  const resetView = () => {
+    setSortDirection('none')
+    setFilterText('')
+    setHideEmpty(false)
+  }
 
   const selectedCellStyle = useMemo(() => {
     return selectedCell ? getCellStyle(selectedCell.r, selectedCell.c) : null
@@ -349,6 +629,41 @@ export default function App() {
           </div>
         </div>
 
+        {/* ── Challenge 2: Sort and filter (non-destructive view) ── */}
+        <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 10, padding: '10px 12px', background: '#f1f5f9', borderBottom: '1px solid #d1d5db', fontSize: 13 }}>
+          <strong>Sort &amp; Filter</strong>
+          <label>Sort column{' '}
+            <select aria-label="Sort column" value={sortColumn} onChange={e => setSortColumn(Number(e.target.value))}>
+              {Array.from({ length: engine.cols }, (_, c) => <option key={c} value={c}>{getColumnLabel(c)}</option>)}
+            </select>
+          </label>
+          <button className="toolbar-btn" onClick={() => setSortDirection('asc')}>A → Z / Small → Large</button>
+          <button className="toolbar-btn" onClick={() => setSortDirection('desc')}>Z → A / Large → Small</button>
+          <label>Filter column{' '}
+            <select aria-label="Filter column" value={filterColumn} onChange={e => setFilterColumn(Number(e.target.value))}>
+              {Array.from({ length: engine.cols }, (_, c) => <option key={c} value={c}>{getColumnLabel(c)}</option>)}
+            </select>
+          </label>
+          <input aria-label="Filter text" placeholder="Contains text…" value={filterText} onChange={e => setFilterText(e.target.value)} style={{ padding: '6px 8px', border: '1px solid #cbd5e1', borderRadius: 4, width: 145 }} />
+          <label><input type="checkbox" checked={hideEmpty} onChange={e => setHideEmpty(e.target.checked)} /> Hide empty rows</label>
+          <button className="toolbar-btn" onClick={resetView}>Reset view</button>
+          <span style={{ color: '#475569' }}>{visibleRows.length} of {engine.rows} rows · {renderedRows.length} mounted</span>
+          {viewIsModified && <span style={{ color: '#9a3412' }}>View only · Reset view to use fill handle</span>}
+        </div>
+
+        {/* ── Challenge 4: local natural-language spreadsheet commands ── */}
+        <form onSubmit={runSheetQuery} aria-label="Spreadsheet natural language queries" style={{ padding: '12px', background: '#eff6ff', borderBottom: '1px solid #bfdbfe' }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8 }}>
+            <strong>Ask the Sheet</strong>
+            <span style={{ color: '#475569', fontSize: 12 }}>Local command parser · no AI API required</span>
+          </div>
+          <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+            <input aria-label="Ask the Sheet query" value={queryText} onChange={e => setQueryText(e.target.value)} placeholder="e.g. average column B, sort column C descending" style={{ flex: 1, minWidth: 0, padding: '8px 10px', border: '1px solid #93c5fd', borderRadius: 5 }} />
+            <button type="submit" className="toolbar-btn">Run query</button>
+          </div>
+          <div role="status" aria-live="polite" style={{ marginTop: 7, fontSize: 13, color: '#1e3a8a' }}>{queryResult}</div>
+        </form>
+
         {/* ── Formula Bar ── */}
         <div className="formula-bar">
           <span className="formula-bar-label">{selectedCellLabel}</span>
@@ -363,7 +678,7 @@ export default function App() {
         </div>
 
         {/* ── Grid ── */}
-        <div className="grid-scroll">
+        <div className="grid-scroll" ref={gridScrollRef} onScroll={e => setScrollTop(e.currentTarget.scrollTop)} onMouseUp={() => { handleCellMouseUp(); finishFill() }} onMouseLeave={handleCellMouseUp} style={{ height: 'min(62vh, 620px)', overflow: 'auto' }}>
           <table className="grid-table">
             <thead>
               <tr>
@@ -376,11 +691,20 @@ export default function App() {
               </tr>
             </thead>
             <tbody>
-              {Array.from({ length: engine.rows }, (_, rowIndex) => (
-                <tr key={rowIndex}>
+              {topSpacerHeight > 0 && (
+                <tr aria-hidden="true" style={{ height: topSpacerHeight }}>
+                  <td colSpan={engine.cols + 1} style={{ height: topSpacerHeight, padding: 0, border: 0, background: 'transparent' }} />
+                </tr>
+              )}
+              {renderedRows.map(rowIndex => (
+                <tr key={rowIndex} style={{ height: VIRTUAL_ROW_HEIGHT }}>
                   <td className="row-header">{rowIndex + 1}</td>
                   {Array.from({ length: engine.cols }, (_, colIndex) => {
-                    const isSelected = selectedCell?.r === rowIndex && selectedCell?.c === colIndex
+                    const isSelected = Boolean(selectionBounds &&
+                      rowIndex >= selectionBounds.minRow &&
+                      rowIndex <= selectionBounds.maxRow &&
+                      colIndex >= selectionBounds.minCol &&
+                      colIndex <= selectionBounds.maxCol)
                     const isEditing = editingCell?.r === rowIndex && editingCell?.c === colIndex
                     const cellData = engine.getCell(rowIndex, colIndex)
                     const style = cellStyles[`${rowIndex},${colIndex}`] || {}
@@ -391,9 +715,18 @@ export default function App() {
                     return (
                       <td
                         key={colIndex}
-                        className={`cell ${isSelected ? 'selected' : ''}`}
-                        style={{ background: style.bg || 'white' }}
-                        onMouseDown={(e) => { e.preventDefault(); handleCellClick(rowIndex, colIndex) }}
+                        className={`cell ${isSelected ? 'selected' : ''} ${fillTarget && selectionBounds && colIndex >= selectionBounds.minCol && colIndex <= selectionBounds.maxCol && rowIndex > selectionBounds.maxRow && rowIndex <= fillTarget.r ? 'selected' : ''}`}
+                        style={{ background: style.bg || 'white', position: 'relative' }}
+                        onMouseDown={(e) => {
+                          if (e.target.tagName === 'INPUT') return
+                          e.preventDefault()
+                          if (fillDragRef.current) return
+                          isDraggingRef.current = true
+                          handleCellClick(rowIndex, colIndex, e.shiftKey)
+                        }}
+                        onMouseEnter={() => handleCellMouseEnter(rowIndex, colIndex)}
+                        onMouseUp={handleCellMouseUp}
+                        onDoubleClick={() => handleCellDoubleClick(rowIndex, colIndex)}
                       >
                         {isEditing ? (
                           <input
@@ -403,7 +736,7 @@ export default function App() {
                             onChange={(e) => setEditValue(e.target.value)}
                             onBlur={() => commitEdit(rowIndex, colIndex)}
                             onKeyDown={(e) => handleKeyDown(e, rowIndex, colIndex)}
-                            ref={isSelected ? cellInputRef : undefined}
+                            ref={editingCell?.r === rowIndex && editingCell?.c === colIndex ? cellInputRef : undefined}
                             style={{
                               fontWeight: style.bold ? 'bold' : 'normal',
                               fontStyle: style.italic ? 'italic' : 'normal',
@@ -428,17 +761,34 @@ export default function App() {
                             {displayValue}
                           </div>
                         )}
+                        {!viewIsModified && isSelected && selectionBounds && rowIndex === selectionBounds.maxRow && colIndex === selectionBounds.maxCol && !isEditing && (
+                          <span
+                            title="Drag down to fill cells"
+                            onMouseDown={(e) => {
+                              e.preventDefault()
+                              e.stopPropagation()
+                              isDraggingRef.current = false
+                              fillDragRef.current = { bounds: { ...selectionBounds }, target: { r: rowIndex, c: colIndex } }
+                            }}
+                            style={{ position: 'absolute', width: 9, height: 9, right: -4, bottom: -4, background: '#1a73e8', border: '1px solid white', cursor: 'crosshair', zIndex: 5 }}
+                          />
+                        )}
                       </td>
                     )
                   })}
                 </tr>
               ))}
+              {bottomSpacerHeight > 0 && (
+                <tr aria-hidden="true" style={{ height: bottomSpacerHeight }}>
+                  <td colSpan={engine.cols + 1} style={{ height: bottomSpacerHeight, padding: 0, border: 0, background: 'transparent' }} />
+                </tr>
+              )}
             </tbody>
           </table>
         </div>
 
         <p className="footer-hint">
-          Click a cell to edit · Enter/Tab/Arrow keys to navigate · Formulas: =A1+B1 · =SUM(A1:A5) · =AVG(A1:A5) · =MAX(A1:A5) · =MIN(A1:A5)
+          Click to select · Double-click to edit · Drag blue square down to fill (normal view) · Sort/filter changes the display order only · Formulas: =A1+B1 · =SUM(A1:A5) · =AVG(A1:A5) · =MAX(A1:A5) · =MIN(A1:A5)
         </p>
       </div>
     </div>
